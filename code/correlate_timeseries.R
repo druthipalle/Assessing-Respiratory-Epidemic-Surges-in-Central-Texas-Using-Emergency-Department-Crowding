@@ -1,6 +1,12 @@
 #/////////////////////////////////////
 # title: "Correlate NEDOCS and HHS Data"
 # author: "Druthi Palle"
+# description: 
+#   This script calculates rolling correlations between NEDOCS scores and 
+#   HHS-reported hospitalizations (COVID+FLU) across Texas hospitals. 
+#   The analysis focuses on how emergency department crowding (as measured by 
+#   NEDOCS) aligns with respiratory infection surges, stratified by hospital size.
+#   A 7-week centered rolling window is used to compute correlations over time.
 #/////////////////////////////////////
 
 #### Load libraries ####
@@ -8,191 +14,217 @@ source("get_packages_used.R")
 
 #### Load Data ####
 hhs_input = "../input_data/CATRAC_hhs_hospitals.csv"
+
 if(!file.exists(hhs_input)){
-  CATRAC_county_df = read_csv("input_data/CATRAC_counties.csv") %>% # TSA O county names + fips
+  
+  # Load county-level info for TSA-O (Central Texas region) with FIPS codes
+  CATRAC_county_df = read_csv("input_data/CATRAC_counties.csv") %>%
     mutate(FIPS = as.character(FIPS))
   
+  # Load raw HHS hospital-level data
   hhs_data = read_csv("../big_input_data/COVID-19_Reported_Patient_Impact_and_Hospital_Capacity_by_Facility_20241007.csv") %>% # 104506 rows
-    filter(state=="TX") %>% # 92347
-    mutate(fips_code = as.character(fips_code),
-           collection_week = as.Date(collection_week),
-           ccn = as.factor(ccn)) %>%
-    filter(fips_code %in% CATRAC_county_df$FIPS) # 6452
-  hhs_data[hhs_data==-999999.0] = 3 # data anonymized because too few people?
-  # length(unique(hhs_data$ccn)) # 32 hospitals, so a little less than 34 in NEDOCS
+    filter(state=="TX") %>%
+    mutate(
+      fips_code = as.character(fips_code),         # Standardize FIPS format
+      collection_week = as.Date(collection_week),  # Convert to Date type
+      ccn = as.factor(ccn)                         # Treat hospital CCNs as categorical
+      ) %>%
+    filter(fips_code %in% CATRAC_county_df$FIPS)   # Keep only hospitals in the CATRAC region
   
+  # Replace placeholder -999999.0 values (possibly due to privacy suppression) with 3
+  hhs_data[hhs_data==-999999.0] = 3                
+  
+  # Save cleaned and filtered data for future use
   write.csv(hhs_data, hhs_input, row.names = F)
-}else{
+  
+} else {
+  
+  # Load the previously cleaned and saved HHS data
   hhs_data = read_csv(hhs_input, col_types = c(collection_week="D", fips_code="c", ccn="c"))
+  
 } # end if hhs data not cleaned
 
-# Load original data, but fix hospitals not anonymized & anomalies in bed counts
-#  Replace with the true score in 24hrs rather than just start date
-#    nedocs_hourly = read_csv("produced_data/hourly_nedocs_timeseries.csv")
+#### Load and Preprocess NEDOCS Data ####
 nedocs_input = "../input_data/sample_NEDOCS_data.csv"
 
-#/////////////////////////////////////////////
-# weight metrics by time per day
+####  Create Time-Weighted Daily NEDOCS Metrics #### 
+# This section computes time-weighted daily averages for various NEDOCS input variables
+# across all hospitals. Weights are based on the number of hours a given observation spans.
+# This provides a more accurate daily summary than a simple mean.
+
 time_weighted_nedocs <- nedocs_og_df %>%
-  arrange(RESOURCE, START_DATE) %>%
-  mutate(START_DATE = as.Date(START_DATE)) %>%
-  group_by(RESOURCE, START_DATE) %>%
+  arrange(RESOURCE, START_DATE) %>%             # Sort by hospital (RESOURCE) and start time
+  mutate(START_DATE = as.Date(START_DATE)) %>%  # Ensure date is in Date format
+  group_by(RESOURCE, START_DATE) %>%            # Group by hospital and day
   summarise(
     across(
-      .cols = c(NEDOCS_SAT_SCORE, ED_BEDS_A, INPATIENT_BEDS_B, ED_PATIENTS_C, CRITICAL_CARE_PATIENTS_D,
-                LONGEST_ED_ADMIT_E, ED_ADMITS_F, LAST_DOOR_TO_BED_TIME_G,
-                ED_BEDS_A_clean, INPATIENT_BEDS_B_clean),
+      # Apply time-weighted averaging to each key NEDOCS metric
+      .cols = c(
+        NEDOCS_SAT_SCORE, ED_BEDS_A, INPATIENT_BEDS_B, ED_PATIENTS_C,
+        CRITICAL_CARE_PATIENTS_D, LONGEST_ED_ADMIT_E, ED_ADMITS_F,
+        LAST_DOOR_TO_BED_TIME_G, ED_BEDS_A_clean, INPATIENT_BEDS_B_clean
+      ),
       .fns = ~ sum(.x * DURATION_HOURS, na.rm = TRUE) / sum(DURATION_HOURS, na.rm = TRUE),
-      .names = "tw_{.col}"
+      .names = "tw_{.col}"  # Prefix with 'tw_' to indicate time-weighted metric
     )
   ) %>%
   mutate(
-    CC_ED_Proportion = tw_CRITICAL_CARE_PATIENTS_D/tw_ED_PATIENTS_C,
-    CC_ED_Proportion_cap = ifelse(CC_ED_Proportion>1, 1, CC_ED_Proportion)
+    # Calculate proportion of critical care patients among ED patients
+    CC_ED_Proportion = tw_CRITICAL_CARE_PATIENTS_D / tw_ED_PATIENTS_C,
+    
+    # Cap the proportion at 1 to account for data noise or small denominators
+    CC_ED_Proportion_cap = ifelse(CC_ED_Proportion > 1, 1, CC_ED_Proportion)
   ) %>%
-  ungroup()
+  ungroup()  # Remove grouping to finalize the cleaned dataset
 
-#///////////////////////////////////////////
-#### Convert NEDOCS to match HHS Weekly ####
-last_day_hhs_data = max(hhs_data$collection_week, na.rm = T)+6
+#### Convert NEDOCS to Match HHS Weekly Data ####
+# Get the last day of HHS data (collection_week is always Friday, so add 6 to include full week)
+last_day_hhs_data = max(hhs_data$collection_week, na.rm = TRUE) + 6
+
+# Filter and align daily NEDOCS with weekly HHS periods
 nedocs_weekly <- time_weighted_nedocs %>%
-  filter(START_DATE<=last_day_hhs_data) %>%
+  filter(START_DATE <= last_day_hhs_data) %>%  # Trim NEDOCS data to match HHS reporting period
   left_join(
     hhs_data %>%
       dplyr::select(collection_week) %>%
-      distinct(),
+      distinct(),  # Get unique weekly HHS reporting start dates
     by = c("START_DATE" = "collection_week"), keep=T) %>%
   dplyr::select(collection_week, START_DATE,
                 everything()
   ) %>%
-  # collection_week is the start of the reporting period (Friday)
-  fill(collection_week, .direction = "down") %>%
-  drop_na(collection_week) %>%
-  group_by(RESOURCE, collection_week) %>%
+  fill(collection_week, .direction = "down") %>%  # Fill down collection_week to assign week to daily rows
+  drop_na(collection_week) %>%                    # Drop any rows not associated with an HHS week
+  group_by(RESOURCE, collection_week) %>%         # Group by hospital and HHS week
   summarise(
+    # Calculate weekly summary statistics (mean, median, min, max) for each time-weighted metric
     across(tw_NEDOCS_SAT_SCORE:tw_INPATIENT_BEDS_B_clean, mean,   .names = "{.col}_mean"),
     across(tw_NEDOCS_SAT_SCORE:tw_INPATIENT_BEDS_B_clean, median, .names = "{.col}_median"),
     across(tw_NEDOCS_SAT_SCORE:tw_INPATIENT_BEDS_B_clean, min,    .names = "{.col}_min"),
     across(tw_NEDOCS_SAT_SCORE:tw_INPATIENT_BEDS_B_clean, max,    .names = "{.col}_max")
   ) %>%
   ungroup() %>%
-  mutate(max_staffed_beds = tw_ED_BEDS_A_clean_max + tw_INPATIENT_BEDS_B_clean_max,
-         mean_staffed_beds = tw_ED_BEDS_A_clean_mean + tw_INPATIENT_BEDS_B_clean_mean
-  ) %>%
-  filter(!(RESOURCE %in% c("0018c00002S8O0ZAAV", # Almost all 0 for ED Admits & NEDOCS score
-                           "0018c00002S8TgUAAV"  # only 1 point in time period of comparison
-  ))) # end filter
+  mutate(
+    # Estimate total number of staffed beds (ED + inpatient)
+    max_staffed_beds = tw_ED_BEDS_A_clean_max + tw_INPATIENT_BEDS_B_clean_max,
+    mean_staffed_beds = tw_ED_BEDS_A_clean_mean + tw_INPATIENT_BEDS_B_clean_mean
+  ) # end filter
 
-# Get cluster NEDOCS hospitals by size difference of ED and IP
+#### Classify Hospitals by Size Based on ED vs Inpatient Bed Difference ####  
 hospital_size_df <- time_weighted_nedocs %>%
   group_by(RESOURCE) %>%
   summarise(
-    mean_ed_beds = mean(tw_ED_BEDS_A_clean, na.rm = TRUE),
-    mean_inpt_beds = mean(tw_INPATIENT_BEDS_B_clean, na.rm = TRUE),
-    med_ed_beds = median(tw_ED_BEDS_A_clean, na.rm = TRUE),
-    med_inpt_beds = median(tw_INPATIENT_BEDS_B_clean, na.rm = TRUE),
+    mean_ed_beds     = mean(tw_ED_BEDS_A_clean, na.rm = TRUE),
+    mean_inpt_beds   = mean(tw_INPATIENT_BEDS_B_clean, na.rm = TRUE),
+    med_ed_beds      = median(tw_ED_BEDS_A_clean, na.rm = TRUE),
+    med_inpt_beds    = median(tw_INPATIENT_BEDS_B_clean, na.rm = TRUE),
     .groups = "drop"
   ) %>%
   mutate(
+    # Calculate median difference between inpatient and ED beds
     diff_median = med_inpt_beds - med_ed_beds,
+    # Classify hospital by size based on median bed difference
     hosp_size = case_when(
       diff_median >= 100 ~ "LARGE",
-      diff_median >= 20  ~ "MEDIUM",  # no need to check `< 100`, already implied
-      diff_median < 20   ~ "SMALL",
-      TRUE ~ NA_character_  # fallback if something goes wrong
+      diff_median >= 20  ~ "MEDIUM",  # Implicitly excludes >=100
+      diff_median <  20  ~ "SMALL",
+      TRUE ~ NA_character_  # Catch-all fallback
     )
   ) %>%
-  # removes "0018c00002S8O0aAAF", "0018c00002S8O1LAAV"
+  # Remove hospitals where difference is too small to be meaningful or unreliable
   filter(diff_median > 1)
 
-# Join size estimate to NEDOCS weekly
+#### Merge Size Labels Back Into Weekly NEDOCS Summary ####
 nedocs_weekly_size = nedocs_weekly %>%
-  left_join(hospital_size_df, by="RESOURCE")
+  left_join(hospital_size_df, by = "RESOURCE")
 
+#### CORRELATE NEDOCS & HHS #### 
 
-
-############ CORR NEDOCS & HHS ###########################
-# HHS DATA
+### Step 1: Clean & Interpolate HHS Weekly Data ###
 hhs_data_na_approx <- hhs_data %>%
   group_by(ccn) %>%
   arrange(collection_week) %>%
   mutate(
-    total_beds_7_day_avg = 
-      approx(collection_week, total_beds_7_day_avg, xout = collection_week, rule = 2, ties = mean)$y,
+    # Interpolate missing values for key HHS variables using linear approximation per hospital (rule = 2 extends ends)
+    total_beds_7_day_avg = approx(collection_week, total_beds_7_day_avg, xout = collection_week, rule = 2, ties = mean)$y,
     
-    total_pediatric_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg = 
+    total_pediatric_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg =
       approx(collection_week, total_pediatric_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg, xout = collection_week, rule = 2, ties = mean)$y,
     
-    total_adult_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg = 
+    total_adult_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg =
       approx(collection_week, total_adult_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg, xout = collection_week, rule = 2, ties = mean)$y,
     
-    staffed_icu_adult_patients_confirmed_and_suspected_covid_7_day_avg = 
+    staffed_icu_adult_patients_confirmed_and_suspected_covid_7_day_avg =
       approx(collection_week, staffed_icu_adult_patients_confirmed_and_suspected_covid_7_day_avg, xout = collection_week, rule = 2, ties = mean)$y,
     
-    total_patients_hospitalized_confirmed_influenza_7_day_coverage = 
+    total_patients_hospitalized_confirmed_influenza_7_day_coverage =
       approx(collection_week, total_patients_hospitalized_confirmed_influenza_7_day_coverage, xout = collection_week, rule = 2, ties = mean)$y,
     
-    icu_patients_confirmed_influenza_7_day_coverage = 
+    icu_patients_confirmed_influenza_7_day_coverage =
       approx(collection_week, icu_patients_confirmed_influenza_7_day_coverage, xout = collection_week, rule = 2, ties = mean)$y
   ) %>%
   ungroup() %>%
-  select(ccn, collection_week, total_beds_7_day_avg,
-         total_pediatric_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg,
-         total_adult_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg,
-         staffed_icu_adult_patients_confirmed_and_suspected_covid_7_day_avg,
-         total_patients_hospitalized_confirmed_influenza_7_day_coverage,
-         icu_patients_confirmed_influenza_7_day_coverage) %>%
-  group_by(ccn,collection_week) %>%
-  arrange( ccn,collection_week) %>%
+  # Keep only relevant columns for correlation
+  select(
+    ccn, collection_week, total_beds_7_day_avg,
+    total_pediatric_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg,
+    total_adult_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg,
+    staffed_icu_adult_patients_confirmed_and_suspected_covid_7_day_avg,
+    total_patients_hospitalized_confirmed_influenza_7_day_coverage,
+    icu_patients_confirmed_influenza_7_day_coverage
+  ) %>%
+  group_by(ccn, collection_week) %>%
+  arrange(ccn, collection_week) %>%
   rowwise() %>%
   mutate(
+    # Combine COVID & FLU inpatient/ICU/pediatric/adult totals into a single sum for visualization and comparison
     IP_ICU_ped_ad_COVFLU_7d_avg_sum = sum(c_across(c(
       total_pediatric_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg,
       total_adult_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg,
       staffed_icu_adult_patients_confirmed_and_suspected_covid_7_day_avg,
-      # )), na.rm = TRUE),
-      # 
-      # IP_ICU_ped_ad_FLU_7d_avg_sum = sum(c_across(c(
       total_patients_hospitalized_confirmed_influenza_7_day_coverage,
       icu_patients_confirmed_influenza_7_day_coverage
     )), na.rm = TRUE)
   ) %>%
   ungroup()
 
-hhs_hosp_size = hhs_data_na_approx %>%
+### Step 2: Classify Hospitals by Size Using HHS Bed Counts ###
+hhs_hosp_size <- hhs_data_na_approx %>%
   group_by(ccn) %>%
   summarise(
     mean_total_beds = mean(total_beds_7_day_avg, na.rm = TRUE),
-    med_total_beds = median(total_beds_7_day_avg, na.rm = TRUE),
+    med_total_beds  = median(total_beds_7_day_avg, na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  mutate(hosp_size =
-           case_when(mean_total_beds <=25  | med_total_beds <=25   ~ "SMALL",
-                     mean_total_beds <=100 | med_total_beds <=100  ~ "MEDIUM",
-                     mean_total_beds > 100 | med_total_beds > 100  ~ "LARGE",
-                     TRUE ~ NA_character_  # fallback if something goes wrong
-           )
+  mutate(
+    # Classify hospitals into SMALL, MEDIUM, or LARGE based on mean or median total beds
+    hosp_size = case_when(
+      mean_total_beds <= 25 | med_total_beds <= 25   ~ "SMALL",
+      mean_total_beds <= 100 | med_total_beds <= 100 ~ "MEDIUM",
+      mean_total_beds > 100  | med_total_beds > 100  ~ "LARGE",
+      TRUE ~ NA_character_  # fallback
+    )
   )
-# Pretty similar sizing to the NEDOCS data for comparison, but not exact
+
+# Quick check of size distribution
 table(hhs_hosp_size$hosp_size)
-# LARGE MEDIUM  SMALL 
-#    11     11     10 
+#   LARGE MEDIUM SMALL 
+#     11     11     10 
 
-# Full DF with approx hosp size and the summed COV + FLU columns
-hhs_data_na_approx_size = hhs_data_na_approx %>%
-  left_join(hhs_hosp_size, by="ccn")
+### Step 3: Join HHS Size Classifications and Visualize Epidemic Curves ###
+hhs_data_na_approx_size <- hhs_data_na_approx %>%
+  left_join(hhs_hosp_size, by = "ccn")
 
-# Actually looks like epidemic curves
-# FLU alone looked like almost nothing, so we should merge FLU as it's negligable contribution
+# Plot epidemic curves for COVID+FLU by hospital size
 ggplot(
   hhs_data_na_approx_size,
-  aes(x=collection_week, 
-      y=IP_ICU_ped_ad_COVFLU_7d_avg_sum,
-      group=ccn, color=hosp_size))+
-  geom_line()+
-  facet_wrap(~hosp_size, ncol=1, scales="free_y")+
+  aes(x = collection_week,
+      y = IP_ICU_ped_ad_COVFLU_7d_avg_sum,
+      group = ccn, color = hosp_size)) +
+  geom_line() +
+  facet_wrap(~hosp_size, ncol = 1, scales = "free_y") +
   theme_bw()
 
+### Step 4: Collapse HHS to Weekly by Hospital Size ###
 hhs_hosp_size_covflu_weekly <- hhs_data_na_approx_size %>%
   group_by(hosp_size, collection_week) %>%
   summarise(
@@ -201,64 +233,64 @@ hhs_hosp_size_covflu_weekly <- hhs_data_na_approx_size %>%
     .groups = "drop"
   )
 
-# Median shows peaks a little better, and in general is less susceptibel to outliers 
-# The Hospial Size classification isn't perfectly aligned to our NEDCOCS sizing, but close
+# Plot median epidemic curves (less sensitive to outliers)
 ggplot(
   hhs_hosp_size_covflu_weekly,
-  aes(x=collection_week, 
-      y=IP_ICU_ped_ad_COVFLU_size_med,
-      color=hosp_size))+
-  geom_line()+
-  facet_wrap(~hosp_size, ncol=1, scales="free_y")+
+  aes(x = collection_week,
+      y = IP_ICU_ped_ad_COVFLU_size_med,
+      color = hosp_size)) +
+  geom_line() +
+  facet_wrap(~hosp_size, ncol = 1, scales = "free_y") +
   theme_bw()
 
-# NEDOCS DATA
+### Step 5: Collapse NEDOCS to Weekly Averages by Size ###
 nedocs_avg_by_week <- nedocs_weekly_size %>%
-  group_by(collection_week, hosp_size) %>% 
+  group_by(collection_week, hosp_size) %>%
   summarise(
     avg_nedocs = mean(tw_NEDOCS_SAT_SCORE_mean, na.rm = TRUE),
-    .groups = "drop") %>%
-  drop_na()
+    .groups = "drop"
+  ) %>%
+  drop_na()  # Remove weeks with missing NEDOCS data
 
-#//////////////////////////////////////////////////////////////////////////
-# ALIGN NEDOCS & HHS TIME INTERVALS
+#### ALIGN NEDOCS & HHS TIME INTERVALS #### 
+# Join the weekly aggregated NEDOCS and HHS data by hospital size and collection week
+# Ensures that only weeks present in both datasets are kept
 nedocs_hhs_compare_df = hhs_hosp_size_covflu_weekly %>%
-  left_join(nedocs_avg_by_week, by=c("collection_week", "hosp_size")) %>%
-  # Weeks in HHS not in NEDOCS will be NA for the NEDOCS value
-  drop_na(avg_nedocs)
+  left_join(nedocs_avg_by_week, by = c("collection_week", "hosp_size")) %>%
+  drop_na(avg_nedocs)  # remove weeks missing NEDOCS data
 
-# PLOT HHS DATA
+# Plot HHS COVID+FLU Hospitalizations (by size)
 flucov_weekly_plt = ggplot(nedocs_hhs_compare_df, 
                            aes(x = collection_week, 
                                y = IP_ICU_ped_ad_COVFLU_size_mean,
-                               color=hosp_size)) +
-  geom_line(linewidth = 1) +
-  facet_wrap(~hosp_size, ncol=3) + # , scales="free"
+                               color = hosp_size)) +
+  geom_line(linewidth = 1) +  # main line plot
+  facet_wrap(~hosp_size, ncol = 3) +  # separate plots per hospital size
   labs(x = "Collection Week", 
        y = "Mean COVID+FLU Hospitalizations") +
-  theme_bw(base_size = 15)+
-  theme(axis.title.x = element_blank(),
-        legend.position = "none")
+  theme_bw(base_size = 15) +
+  theme(axis.title.x = element_blank(),  # remove x-axis label (shared below)
+        legend.position = "none")  # simplify plot by hiding legend
 
-# PLOT NEDOCS
+# Plot NEDOCS
 nedocs_thresholds <- tibble::tibble(
   yintercept = c(20, 60, 100, 140, 180),
   label = c("Not busy", "Busy", "Extremely busy", "Overcrowded", "Disaster"),
-  hosp_size = "SMALL"  # only want labels on this facet
+  hosp_size = "SMALL"  # show labels only in SMALL facet
 )
 
-nedocs_weekly_plt = 
+nedocs_weekly_plt <-
   ggplot(nedocs_hhs_compare_df, 
-         aes(x = collection_week, 
-             y = avg_nedocs,
-             color = hosp_size)) +
+                           aes(x = collection_week, 
+                               y = avg_nedocs,
+                               color = hosp_size)) +
   geom_line(linewidth = 1) +
   
-  # Add horizontal lines for all facets
+  # Add dashed horizontal reference lines at key NEDOCS score levels
   geom_hline(yintercept = c(20, 60, 100, 140, 180),
              linetype = "dashed", color = "gray60", linewidth = 0.4) +
   
-  # Add labels only to SMALL hospital facet
+  # Add threshold labels (only appears in SMALL facet)
   geom_text(data = nedocs_thresholds,
             aes(x = max(nedocs_hhs_compare_df$collection_week),
                 y = yintercept,
@@ -276,11 +308,12 @@ nedocs_weekly_plt =
     legend.position = "none"
   )
 
-# CORRELATION
+# Use 8-week sliding window to calculate correlations
 rolling_corr_df <- nedocs_hhs_compare_df %>%
   arrange(hosp_size, collection_week) %>%
   group_by(hosp_size) %>%
   mutate(
+    # Correlation at same week (lag 0)
     corr_lag0 = slider::slide_dbl(
       .x = cur_data(),
       .f = ~ {
@@ -292,23 +325,11 @@ rolling_corr_df <- nedocs_hhs_compare_df %>%
           NA_real_
         }
       },
-      .before = 7, .after = 0,
+      .before = 7, .after = 0,  # 8-week rolling window
       .complete = TRUE
     ),
-    # corr_lag1 = slider::slide_dbl(
-    #   .x = cur_data(),
-    #   .f = ~ {
-    #     x <- head(.x$avg_nedocs, -1)
-    #     y <- tail(.x$IP_ICU_ped_ad_COVFLU_size_mean, -1)
-    #     if (length(na.omit(x)) >= 3 && length(na.omit(y)) >= 3) {
-    #       cor(x, y, use = "complete.obs")
-    #     } else {
-    #       NA_real_
-    #     }
-    #   },
-    #   .before = 7, .after = 0,
-    #   .complete = TRUE
-    # ),
+    
+    # Correlation with 2-week lead in NEDOCS (i.e., NEDOCS leads HHS)
     corr_lag2 = slider::slide_dbl(
       .x = cur_data(),
       .f = ~ {
@@ -326,6 +347,7 @@ rolling_corr_df <- nedocs_hhs_compare_df %>%
   ) %>%
   ungroup()
 
+# Reshape to long format for plotting
 rolling_corr_long <- rolling_corr_df %>%
   pivot_longer(
     cols = starts_with("corr_lag"),
@@ -333,7 +355,8 @@ rolling_corr_long <- rolling_corr_df %>%
     values_to = "rolling_corr"
   )
 
-roll_corr_plot =
+# Plot Rolling Correlations
+roll_corr_plot <-
   ggplot(rolling_corr_long,
          aes(x = collection_week, y = rolling_corr, 
              color=hosp_size, linetype = lag_type)) +
@@ -350,9 +373,11 @@ roll_corr_plot =
   ) +
   guides(color = "none")
 
+# Save the combined plot
 ggsave("../figures/nedocs_flu_covid_correlation.png", 
-       cowplot::plot_grid(flucov_weekly_plt, 
-                          nedocs_weekly_plt, 
-                          roll_corr_plot, 
-                          nrow=3), 
+       cowplot::plot_grid(
+         flucov_weekly_plt,       # Top: COVID+FLU hospitalizations
+         nedocs_weekly_plt,       # Middle: NEDOCS
+         roll_corr_plot,          # Bottom: rolling correlation
+         nrow = 3), 
        width = 12, height = 8, dpi = 1200)
