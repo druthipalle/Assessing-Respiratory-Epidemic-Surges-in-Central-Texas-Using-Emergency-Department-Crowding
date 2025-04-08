@@ -17,7 +17,7 @@ To run the full analysis pipeline, use the following workflow:
    - Aggregated daily data across all hospitals  
    - These outputs are saved in the `produced_data/` folder.
 
-  You can execute this script from the command line using: `Rscript code/nedocs_timeseries_analysis.R 1,2,3,4,5,6 TRUE`
+   You can execute this script from the command line using: `Rscript code/nedocs_timeseries_analysis.R 1,2,3,4,5,6 TRUE`
 
 2. **Correlation Analysis by Hospital Size**  
    Run `code/correlate_timeseries.R` to analyze correlations between NEDOCS scores and respiratory epidemic surges (COVID-19 and flu) across different hospital sizes.
