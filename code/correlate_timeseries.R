@@ -156,11 +156,11 @@ hhs_data_na_approx <- hhs_data %>%
     staffed_icu_adult_patients_confirmed_and_suspected_covid_7_day_avg =
       approx(collection_week, staffed_icu_adult_patients_confirmed_and_suspected_covid_7_day_avg, xout = collection_week, rule = 2, ties = mean)$y,
     
-    total_patients_hospitalized_confirmed_influenza_7_day_coverage =
-      approx(collection_week, total_patients_hospitalized_confirmed_influenza_7_day_coverage, xout = collection_week, rule = 2, ties = mean)$y,
+    total_patients_hospitalized_confirmed_influenza_7_day_avg = 
+      approx(collection_week, total_patients_hospitalized_confirmed_influenza_7_day_avg, xout = collection_week, rule = 2, ties = mean)$y,
     
-    icu_patients_confirmed_influenza_7_day_coverage =
-      approx(collection_week, icu_patients_confirmed_influenza_7_day_coverage, xout = collection_week, rule = 2, ties = mean)$y
+    icu_patients_confirmed_influenza_7_day_avg = 
+      approx(collection_week, icu_patients_confirmed_influenza_7_day_avg, xout = collection_week, rule = 2, ties = mean)$y
   ) %>%
   ungroup() %>%
   # Keep only relevant columns for correlation
@@ -169,8 +169,8 @@ hhs_data_na_approx <- hhs_data %>%
     total_pediatric_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg,
     total_adult_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg,
     staffed_icu_adult_patients_confirmed_and_suspected_covid_7_day_avg,
-    total_patients_hospitalized_confirmed_influenza_7_day_coverage,
-    icu_patients_confirmed_influenza_7_day_coverage
+    total_patients_hospitalized_confirmed_influenza_7_day_avg,
+    icu_patients_confirmed_influenza_7_day_avg
   ) %>%
   group_by(ccn, collection_week) %>%
   arrange(ccn, collection_week) %>%
@@ -181,8 +181,8 @@ hhs_data_na_approx <- hhs_data %>%
       total_pediatric_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg,
       total_adult_patients_hospitalized_confirmed_and_suspected_covid_7_day_avg,
       staffed_icu_adult_patients_confirmed_and_suspected_covid_7_day_avg,
-      total_patients_hospitalized_confirmed_influenza_7_day_coverage,
-      icu_patients_confirmed_influenza_7_day_coverage
+      total_patients_hospitalized_confirmed_influenza_7_day_avg,
+      icu_patients_confirmed_influenza_7_day_avg
     )), na.rm = TRUE)
   ) %>%
   ungroup()
